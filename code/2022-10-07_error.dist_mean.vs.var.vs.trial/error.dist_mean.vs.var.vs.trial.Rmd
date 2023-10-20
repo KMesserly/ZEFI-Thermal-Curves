@@ -1,0 +1,685 @@
+---
+title: "Evaluate How `motif_count` changes with trial at 40C"
+author: "Michael Gilchrist"
+date: "date: 2022-10-20"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  warning = TRUE, # show warnings
+  message = TRUE, # show messages
+  error = TRUE, # do not interrupt generation in case of errors,
+  echo = TRUE#,  # show R code
+  ##results="asis" # Hopefully print summary() in for loops
+  )
+
+
+if(interactive()) default::default(.ess.eval) <- list(max.deparse.length=1E5, output = TRUE)
+
+```
+# Goal
+
+- Evaluate trends in motif_count under a (near) constant temperature.
+
+# Set up
+
+## Load libraries
+
+```{r}
+
+
+## load libraries
+library(stats)
+require(MASS) # provides negative binomial fitting:  glm.nb
+library(RSQLite)  # Don't think we need this.
+library(rTPC)  ## 
+library(nls.multstart)
+library(broom)
+library(tidyverse)
+library(ggplot2)
+library(ggpubr)
+library(grid) ## provides textGrob
+library(gridExtra)
+library(viridisLite)
+
+#options(ggplot2.continuous.colour="viridis",
+#        ggplot2.discrete.colour="viridis",
+#        ggplot2.scale_fill_discrete = scale_fill_viridis_d,
+#        ggplot2.scale_fill_continuous = scale_fill_viridis_c)
+
+library(GGally)
+library(reshape2)
+library(lme4)
+library(nlme)
+library(gnm)
+library(rsample) ## provides bootstraps()
+
+library(RVAideMemoire) # provides overdisp.glmer()
+library(humidity) ## provides VPD
+library(weathermetrics)
+library(latex2exp)
+
+```
+## Local Functions
+
+```{r}
+
+kprint <- function(input, ...) {
+    print(knitr::kable(input, ...))
+cat('\n\n<!-- -->\n\n')
+}
+```
+
+## Plotting settings
+
+```{r}
+
+## From: https://data-se.netlify.app/2018/12/12/changing-the-default-color-scheme-in-ggplot2/
+
+theme_set(theme_minimal(base_size = 9))
+theme_update(
+    plot.title = element_text(size = rel(1.1)),
+    plot.subtitle = element_text(size = rel(1)))
+
+if(!exists("old_opts")) old_opts <- options()  # save old options
+
+options(ggplot2.continuous.colour="viridis")
+options(ggplot2.continuous.fill = "viridis")
+options(ggplot2.discrete.colour="viridis")
+options(ggplot2.discrete.fill = "viridis")
+
+
+```
+
+## Load Data
+
+```{r}
+
+## Read in ZEFI Data sets
+## Treat 'repeatability' as round = 0
+## Add round info
+
+## Repeatability was done between round 1 and 2, female was present, but only one temp. so treating as `round = 2` and redefining `round = 2` as `round = 3`
+
+output_dir <- "output"
+
+if(!dir.exists(output_dir)) dir.create(output_dir)
+git_root <- system("git rev-parse --show-toplevel", intern = TRUE)
+
+data_raw = list()
+
+data_raw[[1]] <- read.csv(file.path(git_root, "data", "collated", "HSPi-Round-1-Heat-Trials.csv")) %>% mutate(round = 1) %>%
+    ## Note T237 and T230 are missing numbers in the motif_count column
+    ## so we are filtering these observations out until they are found
+    filter(!is.na(motif_count))
+
+data_raw[[2]] <- read.csv(file.path(git_root, "data", "collated", "HSPi-Repeatability-Song-Count.csv")) %>%
+    mutate(round = 2) %>%
+    ungroup()
+
+data_raw[[3]] <-read.csv(file.path(git_root, "data", "collated", "HSPi-Round-2-Heat-Trials.csv")) %>%
+    mutate(round = 3) %>%
+    ## Deal with missing temp_mean and humidity_mean values
+    ## in round == 3
+    ## 2022/10/19 - code no longer needed
+    ## group_by(temp_target) %>% 
+    ##mutate(temp = if_else((round == 3 & is.na(temp_mean)),
+    ##                      mean(temp_mean, na.rm = TRUE),
+    ##                      temp_mean)) %>%
+    ##mutate(humidity = if_else((round == 3 & is.na(humidity_mean)),
+    ##                          mean(humidity_mean, na.rm = TRUE),
+    ##                          humidity_mean)) %>%
+    ungroup() 
+
+
+## Join data and discard empty columns
+data_full <- full_join(data_raw[[1]], data_raw[[2]]) %>%
+    full_join(data_raw[[3]]) %>%
+    discard(~all(is.na(.) | . =="")) %>% ## get rid of columns of only NA
+    mutate(trial_completed = !(is.na(motif_count)) ) %>%
+    mutate(motif_count = ifelse(is.na(motif_count), 0, motif_count)) %>%
+    mutate(motif_count = motif_count*1.0) %>% ## convert to a double so it's not treated as an integer
+    mutate(chamber = as.factor(chamber), male = as.factor(male)) %>%
+    ## create a male specific round and global trial index `trial`
+    group_by(male, round) %>%
+    mutate(trial_round = rank(date)) %>%
+    ungroup(round) %>% 
+    mutate(trial = rank(date)) %>%
+    ungroup() %>%
+    mutate(motif_count_plus_1 = (motif_count + 1)) %>%
+    mutate(log_motif_count_plus_1 = log(motif_count + 1)) %>%
+    mutate(temp_target = as.numeric(temp_target)) %>%
+    ## Create generic 'temp' column which is either
+    ## temp_mean, if it exists, or temp_target, if it doesn't
+    mutate(temp = if_else(is.na(temp_mean),
+                          temp_target,
+                          temp_mean)) %>%
+    ## Add column with total motif_count for a given round
+    group_by(male, round) %>%
+    mutate(count_total_round = sum(motif_count)) %>%
+    ungroup() %>%
+    mutate(motif_prop = motif_count/count_total_round) %>%
+    ## assuming poisson error
+    ## From glm man page
+    ## > Non-‘NULL’ ‘weights’ can be used to indicate that different
+    ## >  observations have different dispersions (with the values in
+    ## >  ‘weights’ being inversely proportional to the dispersions);
+    ## add +1 to deal with single 0
+    ## Interpret dispersion as ~sd() or se() not var()
+    mutate(count_wt = sqrt(1/(motif_count + 1))) %>%
+    ## need to rescale wts for motif_prop data
+    mutate(prop_wt = count_wt * count_total_round) %>% 
+    ## Add vpd 
+    mutate(svp = SVP(t = temp_mean + 273.15, isK = TRUE), vpd = svp*(1-humidity_mean/100) ) %>%
+    group_by(round) %>%
+    mutate(vpd_offset = vpd - mean(vpd)) %>%
+    ungroup() %>%
+    relocate(motif_count, motif_prop, vpd, temp_mean, humidity_mean, .after = male) %>% 
+    mutate() ## Dummy function so we can comment out lines above it w/o any issues
+
+
+```
+
+
+# Examine Data
+
+## Create Working Dataset
+
+```{r}
+
+data_ind <- data_full %>%
+#    filter(round %in% c(2,3)) %>%
+#    filter(count_total_round >= 1) %>%
+    mutate()
+
+## copy data frame and assign `male =  "combined")
+data_comb <- data_ind %>% mutate(male = "combined")
+
+data <- bind_rows(data_ind, data_comb)
+
+```
+
+## Examine How Var varies with Mean `temp_target = 40`
+
+**WARNING:** `warning()` are off
+
+```{r, warning = FALSE}
+
+data_40  <- data_ind %>%
+    filter(temp_target == 40) %>%
+    unique()
+
+dim(data_40)
+
+stats_40 <- data_40 %>%
+    group_by(male) %>%
+    summarize(count = length(motif_count),
+              mean = mean(motif_count),
+              var = var(motif_count, na.rm = TRUE),
+              cv = sqrt(var)/mean,
+              dispersion = var/mean) %>% mutate()
+
+print("We have 15 males, 5 of which we only have 1 observation at 40C")
+stats_40
+
+motif_stats <- stats_40
+
+print("Flag birds birds with a coefficient of variation `cv` > 0.5 & `mean` < 50") 
+cv_threshold <- 0.5
+mean_threshold <- 50
+
+male_high_cv <- stats_40 %>% filter(cv > cv_threshold) %>% pull(male)
+data_male_high_cv <- data_40 %>% filter(male %in% male_high_cv)
+
+male_low_mean <- stats_40 %>% filter(mean < mean_threshold) %>% pull(male)
+data_male_low_mean <- data_40 %>% filter(male %in% male_low_mean)
+
+
+g0 <- ggplot(data_male_high_cv) +
+    aes(x=motif_count,
+        color = male,
+        fill = male) + 
+    geom_histogram() +
+    labs(title = paste0("Data for males with exceptionally high cviances", paste(male_high_cv, collapse = " & "))
+         )
+
+
+for(filter_high_cv in c(FALSE, TRUE)){
+    for(filter_low_mean in c(FALSE, TRUE)){
+
+        data_tmp <- data_40
+        motif_stats_tmp <- motif_stats
+        
+        if(filter_high_cv){
+            data_tmp <- filter(data_tmp, !(male %in% male_high_cv) )
+            motif_stats_tmp <- filter(motif_stats_tmp, !(male %in% male_high_cv) )
+        }
+
+        if(filter_low_mean){
+            data_tmp <- filter(data_tmp, !(male %in% male_low_mean) )
+            motif_stats_tmp <- filter(motif_stats_tmp, !(male %in% male_low_mean) )
+        }
+
+        g0 <- ggplot(data_tmp) +
+            aes(x=male,
+                y = motif_count,
+                color = male,
+                fill = male) + 
+            geom_point() +
+            geom_rug(size=0.75) +
+            ## theme(axis.ticks.x=element_line(size=30))+
+            geom_point(
+                mapping = aes(x = male,
+                              y = mean,
+                              color = male),
+                size = 2.5,
+                shape = 24,
+                data = motif_stats_tmp) +
+            theme(legend.position = "none", axis.text.x = element_text(angle = -45)) +
+            labs(title = "Raw Count Data")
+
+        g1 <- ggplot(data_tmp) +
+            aes(x=motif_count,
+                color = male,
+                fill = male) + 
+            geom_histogram() +
+            xlim(0, NA) +
+            labs(title = "Raw Count Data")
+        
+        formula = y ~ -1 + x
+        g2 <- ggplot(motif_stats_tmp) +
+            aes(x=mean, y = var) +
+            geom_point(aes(color = male)) +
+            geom_smooth(method='lm', formula = formula, fullrange = TRUE) +
+            ##stat_cor(label.y.npc = 0.95) +
+            stat_regline_equation(label.y.npc = 0.9, aes(label =  paste(..eq.label.., ..adj.rr.label.., sep = "~~")), formula = formula, size = 2.5) +
+            theme(legend.position = "none") +
+            xlim(0, NA) +
+            labs(title = "Mean vs. var")
+
+        fit_g2 <- lm(var ~ -1 + mean, data = motif_stats_tmp)
+        
+        g3 <- ggplot(motif_stats_tmp) +
+            aes(x=mean, y = var) +
+            geom_point(aes(color = male)) +
+            geom_smooth(method='lm', formula= formula, fullrange = TRUE) +
+            stat_regline_equation(label.y.npc = 0.9, aes(label =  paste(..eq.label.., ..adj.rr.label.., sep = "~~")), formula = formula, size = 2.5) +
+            theme(legend.position = "none") +
+            labs(title = "Mean vs. Var",
+                 subtitle = "log(var) ~ log(mean)") + 
+            scale_x_log10() +
+            scale_y_log10()
+
+
+        formula <- y ~ -1 + x + I(x^2)
+        g4 <- ggplot(motif_stats_tmp) +
+            aes(x=mean, y = var) +
+            geom_point(aes(color = male)) +
+            geom_smooth(method='lm', formula = formula, fullrange = TRUE) +
+            stat_regline_equation(label.y.npc = 0.9, aes(label =  paste(..eq.label.., ..adj.rr.label.., sep = "~~")), formula = formula, size = 2.5) +
+            theme(legend.position = "none") +
+            xlim(0, NA) +
+            labs(title = "Mean vs. Var",
+                 subtitle = "var ~ mean + mean^2")
+                                        #    scale_x_log10() +
+                                        #    scale_y_log10()
+        fit_g4 <- lm(var ~ -1 + mean +  I(mean^2), data = motif_stats_tmp)
+        
+        formula <- y ~ -1 + I(x^2)
+        g5 <- ggplot(motif_stats_tmp) +
+            aes(x=mean, y = var) +
+            geom_point(aes(color = male)) +
+            geom_smooth(method='lm', formula = formula, fullrange = TRUE) +
+            stat_regline_equation(label.y.npc = 0.9,
+                                  aes(label = paste(
+                                          ..eq.label..,
+                                          ..adj.rr.label.., sep = "~~")),
+                                  formula = formula, size = 2.5) +
+            theme(legend.position = "none") +
+            labs(title = "Mean vs. Var",
+                 subtitle = "var ~ mean^2")
+
+        fit_g5 <- lm(var ~ -1 + I(mean^2), data = motif_stats_tmp)
+        #ifelse(length(dev.list()) < 4, dev.new(), dev.next())
+        
+        ga <- grid.arrange(g0, g2, g4, g5,
+                     ncol=2,
+                     top=textGrob(
+                         paste0("Mean vs. Var: Filter High CV = ", filter_high_cv,
+                                ", Low Mean = ", filter_low_mean, "\n temp_target = 40C"),
+                         gp=gpar(fontsize = 11))
+                     )
+        ##cat("\n\n\\pagebreak\n")
+        ##print("<P style='page-break-before: always'>")    #forced new-page happens here.
+
+        print(paste0("Mean vs Var; filter high cv: ", filter_high_cv, "; filter low mean: ", filter_low_mean))
+        print(summary(fit_g2))
+        print(summary(fit_g4))
+        print(summary(fit_g5))
+
+ga
+        
+        dev.print(device = pdf, file = file.path(output_dir, paste0("mean.vs.var_filter.high-", filter_high_cv, ".filter.low.mean-", filter_low_mean, ".pdf")))
+        
+    }
+}
+
+```
+
+
+### Conclusion
+
+- Excluding males with very high variances indicates that for the remaining males `var ~ mean`, but overdispersed relative to the poisson.
+- Using multiple trials at one temp could be an effective way to identify 'reliable' males.
+
+
+## Compare `motif_count` vs `trial` at 40C
+
+**WARNING:** `warning()` are off
+
+```{r, warning = FALSE}
+
+for(filter_high_cv in c(FALSE, TRUE)){
+    for(filter_low_mean in c(FALSE, TRUE)){
+        
+
+        data_tmp <- data_40 %>% group_by(male) %>%
+            arrange(trial, .by_group = TRUE) %>%
+            mutate(cummean = cummean(motif_count)) %>%
+            select(male, trial, motif_count, cummean)
+        
+        if(filter_high_cv){
+            data_tmp <- filter(data_tmp, !(male %in% male_high_cv) )
+        }
+
+        if(filter_low_mean){
+            data_tmp <- filter(data_tmp, !(male %in% male_low_mean) )
+        }
+        
+        
+
+
+        g1 <- ggplot(data_tmp) +
+            aes(x = trial, y = motif_count) +
+            geom_point(aes(color = male), position = "jitter") +
+            geom_line(aes(x = trial, y = cummean, color = male)) +
+            theme(legend.position="bottom")
+        
+        legend <- get_legend(g1)
+
+
+        ## Apply a linear regression
+
+        formula <- y ~ 1 + x
+        g0 <- ggplot(data_tmp, aes(x = trial, y = motif_count)) +
+            geom_point(aes(color = male))
+
+        
+        g2 <- g0 +
+            geom_smooth(method = 'glm', formula = formula, fullrange = TRUE) +
+            stat_regline_equation(label.y.npc = 0.9, aes(label =  paste(..eq.label.., ..adj.rr.label.., sep = "~~")), formula = formula, size = 2.5) +
+            theme(legend.position = "none") +
+            xlim(1, NA) +
+            labs(title = "Linear")
+        ##g2
+
+        fit_g2 <- glm( motif_count ~ 1 + trial, data = data_tmp)
+
+        g3 <- g0 + geom_smooth(method = 'glm',
+                               formula= formula,
+                               ## Can't use link = identity because it leads to negative expectations
+                               method.args = list(family = quasipoisson(link = "log"))) +
+            stat_regline_equation(label.y.npc = 0.9, aes(label =  paste(..eq.label.., ..adj.rr.label.., sep = "~~")), formula = formula, size = 2.5) +
+            theme(legend.position = "none") +
+            xlim(1, NA) +
+            labs(title = "log-linear: family = qpoisson(link = log)")
+        ##g3
+        
+        fit_g3 <- glm( motif_count ~ 1 + trial, data = data_tmp,
+                      family = quasipoisson(link = "log"))
+        formula <- y ~ 1 + x + I(x^2)
+        g4 <- g0 + geom_smooth(method='glm',
+                               formula= formula,
+                               ## Can't use link = identity because it leads to negative expectations
+                               method.args = list(family = quasipoisson(link = "log"))) +
+            stat_regline_equation(label.y.npc = 0.9, aes(label =  paste(..eq.label.., ..adj.rr.label.., sep = "~~")), formula = formula, size = 2.5) +
+            theme(legend.position = "none") +
+            xlim(1, NA) +
+            labs(title = "log-quad: family = qpoisson(link = log)")
+        ##g4
+        
+        fit_g4 <- glm(motif_count ~ 1 + trial + I(trial^2), data = data_tmp,
+                      family = quasipoisson(link = "log"))
+
+        ga <- grid.arrange(g2, g3, g4, as_ggplot(legend),
+                           ncol=2,
+                           top=textGrob(
+                               paste0("motif_count vs. trial: Filter High CV = ", filter_high_cv, ", Low Mean = ", filter_low_mean, "\n temp_target = 40C"),
+                               gp=gpar(fontsize = 11))
+                           )
+        ##cat("\n\n\\pagebreak\n")
+        ##print("<P style='page-break-before: always'>")    #forced new-page happens here.
+
+        print(paste0("motif_count vs. trial; filter.high: ", filter_high_cv, "; filter.low.mean: ", filter_low_mean))
+
+        print(summary(fit_g2))
+        print(summary(fit_g3))
+        print(summary(fit_g4))
+
+        ga
+        
+        dev.print(device = pdf, file = file.path(output_dir, paste0("motif_count.vs.trial_filter.high-", filter_high_cv, ".filter.low.mean-", filter_low_mean, ".pdf")))
+    }
+}
+
+
+```
+
+### Conclusion
+
+When filtering out low mean (which have few trials and, thus, bias the analysis towards a small intercept) results in no evidence that `motif_count` increases with `trial`
+
+# End
+
+```{r, error = FALSE}
+
+knitr::knit_exit()
+
+```
+
+
+## Try asymptotic regression
+
+```{r}
+
+## See: https://www.statforbiology.com/nonlinearregression/usefulequations
+
+    if(FALSE) {
+        ## Try using `nlme`
+        ## I get errors
+        ## Also not specifying error model
+        getInitial(motif_count ~ SSasymp(trial, Asym, resp0, lrc), data = data_tmp)  
+        ar <- nls(motif_count ~ SSasymp(trial, Asym, resp0, lrc), data = data_tmp)
+
+        ## Try using motif_count_plus_1
+        getInitial(motif_count_plus_1 ~ SSasymp(trial, Asym, resp0, lrc), data = data_tmp)  
+        ar <- nls(motif_count_plus_1 ~ SSasymp(trial, Asym, resp0, lrc), data = data_tmp)
+    }
+
+
+    
+    ## Try using gnm
+    ## a - (a - b) exp(-c x) = a - b' exp(-c x) = a - exp(b'' - c x)
+    ## According to TurnerAndFirth2007 R News, this model is written Exp(1 + trial)
+    ## However the model doesn't converge unless we use -1
+    ## I clearly don't understand the model 
+    formula <- motif_count ~ 1 + Mult(Const(-1), Exp(1 + trial))
+    gnm_poisson <- gnm(formula = formula,
+                       data = data_tmp,
+                       ## start = c(50, -1, -0.1),
+                       family = poisson(link = "identity"),
+                       ##weights = 1/motif_count_plus_1,
+                       trace = TRUE,
+                       iterMax = 5000
+                   )
+
+
+    
+    model <- drm(Y ~ X, fct = DRC.asymReg())
+
+
+count_total_round_2_and_3  <- data_ind %>%
+    select(c(male, count_total_round, round)) %>%
+    unique() %>%
+    pivot_wider(names_from = "round", values_from = "count_total_round")%>%
+    select(male, `2`, `3`) %>%
+    print(n=100)
+
+```
+
+## Rounds 2 and 3 vs Temp
+
+```{r}
+
+
+xlab <- "Temperature"
+ylab <- "motif_count"
+
+plot_temp_data <-
+    ggplot(data) + 
+    aes(x = temp,
+        y = motif_count) +
+    facet_wrap("male", scales = "free_y") +
+    geom_point() +
+labs( title = paste( ylab, " vs ", xlab))
+last_plot()
+
+
+pivot_wider(data_ind, names_from = "round", values_from = "count_total_round") %>% select(male, `2`, `3`) %>% filter(!is.na(`3`)) %>% unique()
+
+```
+
+
+## Formal Model Fits to `motif_count`
+
+
+Using
+
+- `x = temp -45C`
+- use `offset(log(count_total_round))` instead of `male` as a factor
+
+```{r}
+
+temp_ref <- 45
+verbose <- 0
+trace <- FALSE
+
+## Try filtering the data a bit more
+## Goal is to get good starting values
+
+data <- data_ind %>%
+    mutate(x1 = (temp - temp_ref)) %>%
+    filter(
+    (round == 3 & count_total_round >= 400) |
+    (round == 2 & count_total_round > 30)
+    ) %>%
+    mutate() %>%
+#    filter( !(male %in% c("T231", "T260"))) %>% 
+    mutate()
+
+make_plot = TRUE;
+
+glm_poisson_1 <- glm(motif_count ~
+                       (1 + male  +  (x1) + I(x1^2)),
+                   data = data,
+                   family = poisson(link = "log")
+                   )
+
+print(summary(glm_poisson_1))
+
+## Add round effect
+glm_poisson_2 <- glm(motif_count ~
+                       (1 + male + round +  (x1) + I(x1^2)),
+                   data = data,
+                   family = poisson(link = "log")
+                   )
+## Results support round effect
+print(summary(glm_poisson_2))
+
+male_coef <-  coef(glm_poisson_2) %>% keep(str_detect(names(.), 'male'))
+
+hist(male_coef, breaks = 30)
+
+## Remove male effect
+glm_poisson_3 <- glm(motif_count ~
+                       (1 + round +  (x1) + I(x1^2)),
+                   data = data,
+                   family = poisson(link = "log")
+                   )
+## Note that using qpoisson doesn't affect MLE
+
+print(summary(glm_poisson_3))
+
+if(make_plot){
+ifelse(length(dev.list()) < 3, {dev.new(); dev.next()}, dev.next())
+    par(mfrow = c(2, 2))
+    plot(glm_poisson_2, ask = FALSE)
+    page_label <- "glm with poisson error"
+    mtext(page_label, outer=TRUE,  cex=1, line=-1.1)
+}
+
+glm_qpoisson_1 <- update(glm_poisson_1,
+                       family = quasipoisson(link = "log")
+                       )
+print(summary(glm_qpoisson_1))
+
+if(make_plot){
+    ifelse(length(dev.list()) < 3, dev.new(), dev.next())
+    par(mfrow = c(2, 2))
+    plot(glm_qpoisson_1, ask = FALSE)
+    page_label <- "glm with poisson error"
+    mtext(page_label, outer=TRUE,  cex=1, line=-1.1)
+##    dev.new()
+##    ggplot(data, aes(temp, motif_count))
+}
+
+glm_qpoisson_2 <- update(glm_poisson_2,
+                       family = quasipoisson(link = "log")
+                       )
+print(summary(glm_qpoisson_2))
+
+if(make_plot){
+    ifelse(length(dev.list()) < 3, dev.new(), dev.next())
+    par(mfrow = c(2, 2))
+    plot(glm_qpoisson_2, ask = FALSE)
+    page_label <- "glm with poisson error"
+    mtext(page_label, outer=TRUE,  cex=1, line=-1.1)
+##    dev.new()
+##    ggplot(data, aes(temp, motif_count))
+}
+
+
+glm_qpoisson_3 <- update(glm_poisson_3,
+                       family = quasipoisson(link = "log")
+                       )
+print(summary(glm_qpoisson_3))
+
+if(make_plot){
+    ifelse(length(dev.list()) < 3, dev.new(), dev.next())
+    par(mfrow = c(2, 2))
+    plot(glm_qpoisson_3, ask = FALSE)
+    page_label <- "glm with poisson error"
+    mtext(page_label, outer=TRUE,  cex=1, line=-1.1)
+##    dev.new()
+##    ggplot(data, aes(temp, motif_count))
+}
+
+```
+
+### Result
+
+- Overdispersion of data makes parameters non-significant
+- Don't how a `motif_prop` approach will solve this issue.
+  
+

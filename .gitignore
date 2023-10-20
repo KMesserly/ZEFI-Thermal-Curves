@@ -1,4 +1,15 @@
 .Rproj.user
 .Rhistory
-.RData
+*.RData
+*.Rdata
 .Ruserdata
+*-2x1.pdf
+tmp*.pdf
+*.rds
+*.html
+*.aux
+\#*
+*.pdf
+*tmp
+*.stan
+.DS_Store

@@ -1,0 +1,634 @@
+---
+title: "Fit rTPC models to `motif_prop` after filtering"
+author: "Michael Gilchrist"
+date: "date: 2022-10-20"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+                      warning = TRUE, # show warnings
+                      message = TRUE, # show messages
+                      error = TRUE, # do not interrupt generation in case of errors,
+                      echo = TRUE#,  # show R code
+                      ##results="asis" # Hopefully print summary() in for loops
+                  )
+
+
+if(interactive()) default::default(.ess.eval) <- list(max.deparse.length=1E5, output = TRUE)
+
+```
+# Goal
+
+- Evaluate trends in motif_count under a (near) constant temperature.
+
+# Set up
+
+## Load libraries
+
+```{r}
+
+
+## load libraries
+library(stats)
+require(MASS) # provides negative binomial fitting:  glm.nb
+library(RSQLite)  # Don't think we need this.
+library(rTPC)  ## 
+library(nls.multstart)
+library(broom)
+library(tidyverse)
+library(ggplot2)
+library(ggpubr)
+library(grid) ## provides textGrob
+library(gridExtra)
+library(viridisLite)
+
+                                        #options(ggplot2.continuous.colour="viridis",
+                                        #        ggplot2.discrete.colour="viridis",
+                                        #        ggplot2.scale_fill_discrete = scale_fill_viridis_d,
+                                        #        ggplot2.scale_fill_continuous = scale_fill_viridis_c)
+
+library(GGally)
+library(reshape2)
+library(lme4)
+library(nlme)
+library(gnm)
+library(rsample) ## provides bootstraps()
+
+library(RVAideMemoire) # provides overdisp.glmer()
+library(humidity) ## provides VPD
+library(weathermetrics)
+library(latex2exp)
+
+```
+## Local Functions
+
+- Copied from brms-first.fitting.Rmd
+
+
+```{r}
+## Taken from: https://stackoverflow.com/a/51330864/5322644
+## Use to get model equations for models in rTPC
+
+help_text <- function(...) {
+    file <- help(...)
+    path <- dirname(file)
+    dirpath <- dirname(path)
+    pkgname <- basename(dirpath)
+    RdDB <- file.path(path, pkgname)
+    rd <- tools:::fetchRdDB(RdDB, basename(file))
+    capture.output(tools::Rd2txt(rd, out="", options=list(underline_titles=FALSE)))
+}
+
+get_model_eq <- function(model) {
+    txt <- help_text(model)
+    eqn_line <- grep("^ +rate = .*$", txt, value = TRUE)
+    #print(paste(model, eqn_line))
+    eqn <- gsub("(^ +rate = | *$)", "", eqn_line) %>%
+        gsub("([^0-9])\\.(\\w+)", "\\1 * \\2", .) %>%
+        gsub("\\.([^0-9])", " * \\1", .) %>%
+        gsub("\\_", "", .)  %>%
+        gsub(" / ", "/", .)  %>%
+        sub("(^ +| +$)", "", .) %>%
+        paste(., collapse = "; ")
+#    print(eqn)
+    df <- tibble(model = model, eq = eqn)
+    return(df)
+}
+
+
+```
+- Create `nls_multstart_fit_db()` to get all model fits.
+
+```{r}
+
+nls_multstart_db <- function (formula, data = parent.frame(), iter, start_lower, 
+    start_upper, supp_errors = c("Y", "N"), convergence_count = NULL, 
+    control, modelweights, verbose = FALSE, ...) {
+    if (missing(supp_errors)) {
+        supp_errors <- "N"
+    }
+    formula <- stats::as.formula(formula)
+    if (any(class(data) %in% c("data.frame", "list", "environment"))) {
+        params_ind <- all.vars(formula[[3]])[all.vars(formula[[3]]) %in% 
+            names(data)]
+        params_est <- all.vars(formula[[3]])[!all.vars(formula[[3]]) %in% 
+            names(data)]
+        params_dep <- all.vars(formula[[2]])
+    }
+    else {
+        stop("data should be a data.frame, list or an environment")
+    }
+    if (missing(start_lower) || missing(start_upper)) {
+        cat("No boundaries specified for the starting values of sought parameters. \n", 
+            "Default values of +/- 1e+10 will be used. This is likely \n", 
+            "to slow the process of finding the best model. \n")
+        r <- readline("Continue with default values [y/n]? ")
+        if (tolower(r) == "n") {
+            stop("Please enter upper and lower parameter boundaries as start_lower and start_upper in function argument.")
+        }
+    }
+    if (missing(start_lower)) 
+        start_lower <- rep(-10^10, length(params_est))
+    if (missing(start_upper)) 
+        start_upper <- rep(10^10, length(params_est))
+    if (length(start_lower) != length(params_est) || length(start_upper) != 
+        length(params_est)) {
+        stop("There must be as many parameter starting bounds as there are parameters")
+    }
+    params_bds <- data.frame(param = params_est, low.bds = unlist(start_lower), 
+        high.bds = unlist(start_upper), stringsAsFactors = FALSE)
+    if (missing(control)) {
+        control <- minpack.lm::nls.lm.control(maxiter = 1000, 
+            ftol = .Machine$double.eps, ptol = .Machine$double.eps)
+    }
+    silent <- ifelse(supp_errors == "Y", TRUE, FALSE)
+    if (silent == TRUE) {
+        oo <- options(warn = -1)
+        on.exit(options(oo))
+    }
+    if ("modelweights" %in% all.vars(formula)) {
+        stop(paste0("The variable name 'modelweights' is reserved for model weights. Please change the name\n", 
+            "of this variable"))
+    }
+    if (missing(modelweights)) {
+        data$modelweights <- rep(1, length(data[[params_dep]]))
+    }
+    else {
+        data$modelweights <- eval(substitute(modelweights), data)
+    }
+    if (length(iter) == 1) {
+        multistart_type <- "shotgun"
+    }
+    else if (length(iter) == nrow(params_bds)) {
+        multistart_type <- "gridstart"
+    }
+    else {
+        stop(paste0("iter should be of length 1 for shotgun approach and of the same length as the\n", 
+            "number of parameters for the gridstart approach."))
+    }
+
+    if (multistart_type == "shotgun") {
+        if(verbose) print("Setting up shotgun strt...")
+        strt <- purrr::map2(params_bds$low.bds, params_bds$high.bds, 
+            ~runif(iter, .x, .y))
+        names(strt) <- params_bds$param
+        strt <- dplyr::bind_rows(strt)
+    }
+    if (multistart_type == "gridstart") {
+        params_bds$iter <- iter
+        strt <- purrr::pmap(as.list(params_bds[, -1]), function(low.bds, 
+            high.bds, iter) seq(from = low.bds, to = high.bds, 
+            length.out = iter))
+        names(strt) <- params_bds$param
+        strt <- tibble::as_tibble(expand.grid(strt))
+    }
+
+    if(verbose) {
+        print(paste0("strt values for ", multistart_type))
+        print(strt)
+    }
+
+    strt$iteration <- 1:nrow(strt)
+    strt <- tidyr::nest(strt, startpars = -iteration)
+
+    fit <- NULL
+    fit_best <- NULL
+    get_fit <- function(start.vals) {
+        try(fit <- minpack.lm::nlsLM(formula, start = start.vals, 
+                                         control = control, data = data, weights = modelweights, 
+                                         ...), silent = silent)
+        return(fit)
+    }
+
+    browser()
+    
+    fits <- purrr::map(strt$startpars, get_fit) %>% tibble("fit" = .)
+    fit_db <- bind_cols(strt, fits) %>% mutate( aic = ifelse(!is.null(fit), stats::AIC(fit), 
+                                 Inf) )
+                                        #dplyr::mutate(allfits,
+                            ## purrr works, but fit is embedded in a list.
+                            ## fit = purrr::map(startpars, get_fit)) ##, AICval = get_aic(fit))
+                                        #fit = get_fit(unlist(startpars)) ) ##, AICval = get_aic(fit))
+    
+    return(fit_db)
+    
+}
+
+```
+
+- Copied from: (https://rmazing.wordpress.com/2012/07/19/a-weighting-function-for-nls-nlslm/)
+- Key usage: `wfct(1/fitted^2)` which uses the fitted value in nls
+
+```{r}
+
+wfct <- function(expr)
+{
+    expr <- deparse(substitute(expr))
+
+    ## create new environment
+    newEnv <- new.env()
+
+    ## get call
+    mc <- sys.calls()[[1]]
+    mcL <- as.list(mc)
+
+    ## get data and write to newEnv
+    DATA <- mcL[["data"]]
+    DATA <- eval(DATA)
+    DATA <- as.list(DATA)
+    NAMES <- names(DATA)
+    for (i in 1:length(DATA)) assign(NAMES[i], DATA[[i]], envir = newEnv)
+
+    ## get parameter, response and predictor names
+    formula <- as.formula(mcL[[2]])
+    VARS <- all.vars(formula)
+    RESP <- VARS[1]
+    RHS <- VARS[-1]
+    PRED <- match(RHS, names(DATA))
+    PRED <- names(DATA)[na.omit(PRED)]
+
+    ## calculate variances for response values if "error" is in expression
+    ## and write to newEnv
+    if (length(grep("error", expr)) > 0) {
+        y <- DATA[[RESP]]
+        x <- DATA[[PRED]]
+        ## test for replication
+        if (!any(duplicated(x))) stop("No replicates available to calculate error from!")
+        ## calculate error
+        error <- tapply(y, x, function(e) var(e, na.rm = TRUE))
+        error <- as.numeric(sqrt(error))
+        ## convert to original repititions
+        error <- rep(error, as.numeric(table(x)))
+        assign("error", error, envir = newEnv)
+    }
+
+    ## calculate fitted or residual values if "fitted"/"resid" is in expression
+    ## and write to newEnv
+    if (length(grep("fitted", expr)) > 0 || length(grep("resid", expr)) > 0) {
+        mc2 <- mc
+        mc2$weights <- NULL
+        MODEL <- eval(mc2)
+        fitted <- fitted(MODEL)
+        resid <- residuals(MODEL)
+        assign("fitted", fitted, newEnv)
+        assign("resid", resid, newEnv)
+    }
+
+    ## return evaluation in newEnv: vector of weights
+    OUT <- eval(parse(text = expr), envir = newEnv)
+    return(OUT)
+}
+
+## Plotting settings
+
+```{r}
+
+## From: https://data-se.netlify.app/2018/12/12/changing-the-default-color-scheme-in-ggplot2/
+
+theme_set(theme_minimal(base_size = 9))
+theme_update(
+    plot.title = element_text(size = rel(1.1)),
+    plot.subtitle = element_text(size = rel(1)))
+
+if(!exists("old_opts")) old_opts <- options()  # save old options
+
+options(ggplot2.continuous.colour="viridis")
+options(ggplot2.continuous.fill = "viridis")
+options(ggplot2.discrete.colour="viridis")
+options(ggplot2.discrete.fill = "viridis")
+
+
+```
+## Create Model Tibble
+
+```{r}
+
+model_def_tbl <- lapply(get_model_names(), get_model_eq) %>% bind_rows(, .id = NULL) %>% tibble()
+                                        #print(model_def_tbl, n = 200, width = 200)
+
+str_rm <- c("exp", "[0-9.]+", "log(2|10|)", "sin", "abs", "pi", "temp")
+pattern <- paste0("\\b", paste0(str_rm, collapse = "\\b|\\b"), "\\b")
+
+## more robust than param_old
+param <- lapply(model_def_tbl$model, function(x) {
+    args <- names(formals(x))
+    args <- args[args !="temp"]
+    str <- paste(args, collapse = ", ")
+}) %>% unlist()
+
+names(param) <- model_def_tbl$model
+
+param_old  <- stringi::stri_extract_all_words(model_def_tbl$eq) %>%
+    lapply(., unique) %>%
+    lapply(., paste, collapse= " ") %>%
+    str_replace_all(., pattern, "") %>%
+    str_replace_all(., "( +$|^ +)", "") %>%
+    str_split(., " +") %>%
+    lapply(., sort) %>%
+    lapply(., paste, collapse = ", ") %>% unlist()
+
+
+n_param <- param %>% str_count(., boundary("word"))
+
+model_tbl <- bind_cols(model_def_tbl, n_param= n_param) %>%
+    bind_cols(. , param = param) %>%
+    arrange(n_param, model) %>%
+    relocate(eq, .after = param) %>%
+    mutate(tmax = as.integer(grepl(pattern = "tmax", x = param, fixed = TRUE))) %>% 
+    mutate(tmin = as.integer(grepl(pattern = "tmin", x = param, fixed = TRUE)))
+
+grid.arrange(tableGrob(model_tbl))
+
+model_tbl_tmax <- model_tbl %>% filter(tmax == 1)
+
+model_tbl_tmax %>% arrange("model")
+
+model_tbl_tmin <- model_tbl %>% filter(tmax == 1)
+
+model_tbl_tmax_no_tmin <- model_tbl %>% filter(tmax == 1 & tmin == 0)
+
+## model_tbl
+```
+
+## Load Data
+
+```{r}
+load(file.path("input", "data.processing_2022-11-09.Rda"),
+     verbose = TRUE)
+
+```
+
+
+# Examine Data
+
+## Create Working Dataset
+
+```{r}
+
+males_filtered_disp <- motif_stats_40C %>%
+    filter(dispersion < 50) %>%
+    pull(male)
+
+males_filtered_mean <- motif_stats %>%
+    filter(mean > 10) %>%
+    pull(male)
+
+males_filtered <- intersect(males_filtered_mean, males_filtered_disp)
+
+##males_selected <-
+
+data_ind <- motif_data %>%
+    filter(male %in% males_filtered) %>%
+    arrange(male) %>%
+    ##    left_join(male_shape, by = "male") %>%
+    mutate()
+
+data_aug <- tibble(
+    male = rep.int(
+    (data_ind$male %>% unique()), 5),
+    temp = 46,
+    motif_count = 0,
+    motif_prop = 0,
+    round = 0,
+    weights = 10) %>%
+    bind_rows(data_ind, .)
+## copy data frame and assign `male =  "combined")
+
+data_comb <- data_ind %>% mutate(male = "combined")
+
+stats_ind <- motif_stats %>%
+    filter(male %in% males_filtered)
+
+```
+
+
+## Plot motif_count
+
+
+```{r}
+
+g1 <- ggplot(data = data_ind) +
+    aes(x = temp, y = motif_count, color = male, shape = male) +
+    ## Redefine shapes. Note need to set 'shape = male' above to prevent there from
+    ## begin two legends: 1 for shape and 1 for color.
+    scale_shape_manual(values = rep(c(16:18), length.out = length(males_filtered))) +
+    geom_point() +
+    scale_color_viridis_d() +
+    labs(title = "motif_count") +
+    theme(legend.position="none")
+
+```
+
+
+
+```{r}
+
+g1 <- ggplot(data = data_ind) +
+    aes(x = temp, y = motif_count, color = male, shape = male) +
+    ## Redefine shapes. Note need to set 'shape = male' above to prevent there from
+    ## begin two legends: 1 for shape and 1 for color.
+    scale_shape_manual(values = rep(c(16:18), length.out = length(males_filtered))) +
+    geom_point() +
+    scale_color_viridis_d() +
+    labs(title = "motif_count") +
+    theme(legend.position="none")
+
+g2 <- ggplot(data = data_ind) +
+    aes(x = temp, y = motif_prop, color = male, shape = male) +
+    scale_shape_manual(values = rep(c(16:18), length.out = length(males_filtered))) +
+    geom_point() +
+    scale_color_viridis_d() +
+    labs(title = "motif_prop") +
+    theme(legend.position="bottom")
+
+
+legend <- get_legend(g2)
+
+g2 <- g2 + theme(legend.position="none")
+
+g3 <- tableGrob(format(data.frame(stats_ind %>% select(male, n_obs, total, mean) %>% unique() ),
+                       digits = 1),
+                theme = ttheme_default(base_size = 8))
+
+grid.arrange(g1, g2, g3, legend, ncol = 2,
+             top=textGrob("Males filtered for dispersion < 50 at 40C & count_mean < 10",
+                          gp=gpar(fontsize = 11))
+             )
+
+
+```
+
+# Analyze Data: 
+
+
+## Models with 3 or 4 parameters
+
+```{r}
+
+model_set <- model_tbl %>% filter(n_param < 5 & n_param > 2)
+model_grob <- tableGrob(model_set)
+
+grid.arrange(model_grob)
+```
+### Mulitple Fits
+
+```{r}
+
+maxiter <- 4000
+minFactor <- min(1/(2*maxiter), 1/1024)
+
+weights_index <- 1:1
+data_indexes <- 1:2
+data_descriptions <- c("Unaugmented", "motif_count at 46C Augmented")
+
+for(data_index in data_indexes ){
+    data <- switch(data_index,
+                   data_ind,
+                   data_aug
+                   )
+    data_desc <- data_descriptions[[data_index]]
+    data <- data %>% rename(rate = motif_prop) %>%
+        select(temp, rate, weights, motif_count_plus_1) %>%
+        data.frame()
+
+
+    ## Define x_range for predictions
+    x_range <- data.frame(temp = seq(min(data$temp), max(data$temp), 0.5))
+
+    pred_tbl <- tibble(x_range)
+
+    fit_list <- list()
+    graph_list <- list()
+    tgrob_list <- list()
+    pred_list <- list()
+    for(wts in weights_index){
+        pred_list[[wts]] <- x_range
+    }
+
+
+    g_base <- ggplot(data, aes(temp, rate)) +
+        geom_point()
+
+    g_preds <- g_base
+    
+    for(model_str in model_set$model) {
+
+        n_param <- formals(model_str) %>% length() - 1
+        iter <- 10 ##rep(5, n_param)
+
+        model_fits <- list()
+        model_graphs <- list()
+        model_tgrobs <- list()
+        ##    model_preds <- list()
+
+
+        start_vals <- get_start_vals(data$temp, data$rate, model_name = model_str)
+        lower <- get_lower_lims(data$temp, data$rate, model_name = model_str)
+        if(sum(!is.finite(lower))) {
+            print(paste0("Warning() in ", model_str, " lower = ", lower, " replacing problematic values with -1000"))
+            lower[!is.finite(lower)] <- -1000
+        }
+        upper <- get_upper_lims(data$temp, data$rate, model_name = model_str)
+        if(sum(!is.finite(upper))) {
+            print(paste0("Warning() in ", model_str, " upper = ", upper, " replacing problematic values with 1000", collapse = " "))
+            upper[!is.finite(upper)] <- 1000
+        }
+        
+        my.formals <- names(formals(model_str)) %>% paste(., collapse = ", ") %>% sub("temp,", "temp = temp,", .)
+        formula <- paste0("rate ~ ", model_str, "(", my.formals, ")") 
+        for(wts in weights_index) {
+
+            ## WARNING: if you use 'weights' as a variable, it uses the column in data$weights even if weights is locally defined.
+            
+            local.weights <- switch(wts,
+                                    rep(1, nrow(data)),
+                                    data$weights
+                                    )
+            
+            
+            fit_db <- nls_multstart_db(formula = formula,
+                                 data = data,
+                                 iter = iter, 
+                                 start_lower = lower*1.01,
+                                 start_upper = upper*0.99,
+                                 ## lower = lower, ## These are passed to nls
+                                 ## upper = upper, ## These are passed to nls
+                                 supp_errors = 'Y',
+                                 modelweights =  local.weights,
+                                 convergence_count = FALSE, ## misleading terminology, set to FALSE
+                                 control = c(maxiter = maxiter,
+                                             maxfev = 100000,
+                                             minFactor = minFactor)
+                                 )
+            
+            get_aic <- function(fit) {
+                AICval <- ifelse(!is.null(fit), stats::AIC(fit), 
+                                 Inf)
+                return(AICval)
+            }
+
+            AIC_all <- lapply(fits_all, get_aic)
+            fit <- first(fits_all)
+            
+
+            summary(fit) %>% print()
+            ##fit_list[[model_str]] <- fit
+
+            ## calculate additional traits
+            if(FALSE) calc_params(fit) %>% mutate_all(round, 2)
+            
+            ## Get predictions of our model using broom::augment(newdata = x_range)
+            ## `newdata` argument runs the predict() function and returns
+            ## predictor values (temp) and fitted values (.fitted).
+            preds <- augment(fit, newdata = x_range)
+            ## plot data and model fit
+            g <- g_base +
+                geom_line(aes(temp, .fitted), preds, col = 'blue') +
+                theme_bw(base_size = 12) +
+                labs(x = 'Temperature (ºC)',
+                     y = 'Song Count',
+                     title = paste0("Fitting ", model_str, ", using weight_index: ", wts))
+            g_preds <- g_preds +
+                geom_line(aes(temp, .fitted), preds, col = 'blue')
+            model_graphs[[wts]] <- g
+
+            model_fits[[wts]] <- fit
+            pred_list[[wts]] <- left_join(pred_list[[wts]], preds, by = "temp") %>%
+                rename("{model_str}" := .fitted)
+            
+            ##        model_tgrobs[[wts]] <- text_grob(label = summary(fit))
+
+        }
+
+        if(FALSE) {
+            ##grid.arrange(grobs = c(model_graphs, model_tgrobs), top = model_str)
+            grid.arrange(grobs = model_graphs, top = model_str)
+        }
+        
+        fit_list[[model_str]] <- model_fits;
+        graph_list[[model_str]] <- model_graphs;
+        tgrob_list[[model_str]] <- model_tgrobs;
+
+    }
+
+}
+
+
+
+for(data_index in data_indexes ){
+    data_desc <- data_descriptions[[data_index]]
+    for(wts in weights_index){
+        pred_data <- pred_list[[wts]]
+        data_long <- melt(pred_data, id = "temp", variable_name= "model")
+        
+        g <- g_base + geom_line(data = data_long, aes(x = temp, y = value, color = variable)) +
+            labs(x = 'Temperature (ºC)',
+                 y = 'Song Prop',
+                 title = paste0("Using weight_index: ", wts, " and data: ", data_desc ))
+    }
+    print(g)
+}
+
+```
+

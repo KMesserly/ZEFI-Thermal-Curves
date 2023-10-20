@@ -1,0 +1,486 @@
+---
+title: "Fifth Fitting of Thermal Models"
+author: "Michael Gilchrist"
+date: "date: 2022-10-20"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  warning = TRUE, # show warnings
+  message = TRUE, # show messages
+  error = TRUE, # do not interrupt generation in case of errors,
+  echo = TRUE  # show R code
+  )
+
+
+if(interactive()) default::default(.ess.eval) <- list(max.deparse.length=1E5, output = TRUE)
+
+```
+# Goal
+
+- Simple, but reasonable fits using GLM qpoisson with either
+  - `motif_count` and `1|male`
+  - `motif_count` and `offset(total_count)`
+  - `motif_prop` with weights
+- Use `temp_ref = 45` per Liz's request
+
+## Notes from 27 Oct 2022 meeting
+
+- TODO Me
+  - Document simplest fits of 
+     - quad qpoisson models to `motif_count`
+     - general quad with weights to `motif_prop`
+     - KEY QUESTION: Does `motif_prop` work as well as `motif_count`? 
+       - If so, use all `motif_prop` data with `rTPC`
+       - Fit lactin 2 and other models in fixed effects framework
+       - Do model selection amongst
+     - What's the diff between `motif_count` vs `motif_prop`
+       - using `male` wiht `motif_count` is more precise accommodation for `male`, but costs us 1 df/male
+       - not using `male` with `motif_prop` is a less precise accommodation with no cost in terms of df.
+         It also allows us to use rTPC models (we think)
+         
+## Resources
+
+### Poisson Regression and its extensions
+
+- Provides some clear examples of R code
+  - https://stats.oarc.ucla.edu/r/dae/negative-binomial-regression/
+  
+- Gives important details on variance terms
+  - file://Rodriguez_2022_models.for.count.data.with.over.dispersion_Lecture.Notes.pdf
+  
+
+
+## Recap
+
+- Using a Gamma model for the error converges, but I don't think it's the appropriate model, it assumes var ~ x^2
+  See: 
+## First and Second Fitting
+
+- Temp is hard to control in chambers, so we should work with `temp_mean` (mean value during trial), not `temp_target`.
+- `humidity_mean` and `temp_mean` strongly co-vary so consider using aggregate index as explanatory variable
+  - Vapor Pressure Deficit (provided by `humidity` package)
+  - Heat Index (formulated for humans, and provided by `weathermetrics`)
+- Round 3 data only for curve fitting
+  - Only round where `temp_mean` and `humidity_mean` exist.
+- `count_total_round` are consistent between Rounds 1 and 3, so could use that info to classify birds, estimate variance function in response, etc.
+- One bird in `round = 3` collapsed during the trial so it was terminated.
+  We've set the `motif_count` from NA to 0 and should consider making at `temp_working` column using `temp_target` in this instance and `temp_mean` in all other instances.
+  Would need to do something similar for relative humidity, i.e. use `mean(humidity_mean)` for the `temp_target` value.
+  
+## Third Fitting
+
+- Created `temp` and `humidity` variables from `temp_mean` and `humidity_mean` for males who didn't collapse, used `mean(temp_mean)` and `mean(humidity_mean)` values for one male that did.
+- Copied `data_full` and set  `male = "combined"` so we could look at all of the data at once.
+- Learned about using `model` argument for glm models
+- Can't fit ME models
+  - I don't understand why the ME model with `motif_count` where we use a RE for the intercept doesn't have a similar effect as using motif_prop.
+    This intercept value is essentially multiplying by a constant, so we could try and specify this value using `offset(log(count_total_round))`.
+    So why doesn't this work?
+
+
+## Fourth Fitting
+
+- Tried fitting lots of variations of `glm` and `glmer`
+- Optimizer matters in terms of convergence.
+- Adding fixed `male` term rather than treating it as RE via `(1|male)` was very important since the variation in overall male singing varies so greatly.
+- poisson fits indicate data is greatly overdispersed.
+- Got one particular form of GLMM (`glmer`) working well (i.e. when there's no covariance matrix).
+  I think this is a valid approach, but am unsure and a bit concerned since the `|` fitting shows the RE for $x1$ and $x1^2$ being close to perfectly correlated.
+- Overall results indicate taht this approach is problematic
+  - Data is extremely overdispersed in these fits.
+  - As a result, no signal beyond a `male` effect on overall activity is reliably detected.
+  
+## Future Steps
+
+
+# Set up
+
+## Install libraries
+
+```{r}
+
+## install packages user might not have by replacing FALSE with TRUE
+if(FALSE) {
+    BiocManager::install("mixOmics") ## needed by RVAideMemoire
+    install.packages(c("RSQLite", "nls.multstart", "lme4", "RVAideMemoire"))
+    ##  Install the thermal curve package from git_hub, not cran
+    remotes::install_github("padpadpadpad/rTPC")
+
+}
+
+## load libraries
+library(stats)
+require(MASS) # provides negative binomial fitting:  glm.nb
+library(RSQLite)  # Don't think we need this.
+library(rTPC)  ## 
+library(nls.multstart)
+library(broom)
+library(tidyverse)
+library(ggplot2)
+library(ggpubr)
+library(gridExtra)
+library(viridisLite)
+
+#options(ggplot2.continuous.colour="viridis",
+#        ggplot2.discrete.colour="viridis",
+#        ggplot2.scale_fill_discrete = scale_fill_viridis_d,
+#        ggplot2.scale_fill_continuous = scale_fill_viridis_c)
+
+library(GGally)
+library(reshape2)
+library(lme4)
+library(rsample) ## provides bootstraps()
+
+library(RVAideMemoire) # provides overdisp.glmer()
+library(humidity) ## provides VPD
+library(weathermetrics)
+library(latex2exp)
+
+```
+
+## Load Data
+
+```{r}
+
+## Read in ZEFI Data sets
+## Treat 'repeatability' as round = 0
+## Add round info
+
+## Repeatability was done between round 1 and 2, female was present, but only one temp. so treating as `round = 2` and redefining `round = 2` as `round = 3`
+
+git_root <- system("git rev-parse --show-toplevel", intern = TRUE)
+
+data_raw = list()
+
+data_raw[[1]] <- read.csv(file.path(git_root, "data", "collated", "HSPi-Round-1-Heat-Trials.csv")) %>% mutate(round = 1) %>%
+    ## Note T237 and T230 are missing numbers in the motif_count column
+    ## so we are filtering these observations out until they are found
+    filter(!is.na(motif_count))
+
+data_raw[[2]] <- read.csv(file.path(git_root, "data", "collated", "HSPi-Repeatability-Song-Count.csv")) %>%
+    mutate(round = 2) %>%
+    group_by(male) %>%
+    mutate(test_order = rank(date)) %>%
+    ungroup()
+
+data_raw[[3]] <-read.csv(file.path(git_root, "data", "collated", "HSPi-Round-2-Heat-Trials.csv")) %>%
+    mutate(round = 3) %>%
+    ## Deal with missing temp_mean and humidity_mean values
+    ## in round == 3
+    ## 2022/10/19 - code no longer needed
+    ## group_by(temp_target) %>% 
+    ##mutate(temp = if_else((round == 3 & is.na(temp_mean)),
+    ##                      mean(temp_mean, na.rm = TRUE),
+    ##                      temp_mean)) %>%
+    ##mutate(humidity = if_else((round == 3 & is.na(humidity_mean)),
+    ##                          mean(humidity_mean, na.rm = TRUE),
+    ##                          humidity_mean)) %>%
+    ungroup() 
+
+
+## Join data and discard empty columns
+data_full <- full_join(data_raw[[1]], data_raw[[2]]) %>%
+    full_join(data_raw[[3]]) %>%
+    discard(~all(is.na(.) | . =="")) %>% ## get rid of columns of only NA
+    mutate(trial_completed = !(is.na(motif_count)) ) %>%
+    mutate(motif_count = ifelse(is.na(motif_count), 0, motif_count)) %>%
+    mutate(motif_count = motif_count*1.0) %>% ## convert to a double so it's not treated as an integer
+    mutate(chamber = as.factor(chamber), male = as.factor(male)) %>%
+    ## create a global variable trial_order based on individual rounds
+    mutate(trial_index = as.integer(round*10+test_order)) %>%
+    mutate(motif_count_plus_1 = (motif_count + 1)) %>%
+    mutate(log_motif_count_plus_1 = log(motif_count + 1)) %>%
+    mutate(temp_target = as.numeric(temp_target)) %>%
+    ## Create generic 'temp' column which is either
+    ## temp_mean, if it exists, or temp_target, if it doesn't
+    mutate(temp = if_else(is.na(temp_mean),
+                          temp_target,
+                          temp_mean)) %>%
+    ## Add column with total motif_count for a given round
+    group_by(male, round) %>%
+    mutate(count_total_round = sum(motif_count)) %>%
+    ungroup() %>%
+    mutate(motif_prop = motif_count/count_total_round) %>%
+    ## assuming poisson error
+    ## From glm man page
+    ## > Non-‘NULL’ ‘weights’ can be used to indicate that different
+    ## >  observations have different dispersions (with the values in
+    ## >  ‘weights’ being inversely proportional to the dispersions);
+    ## add +1 to deal with single 0
+    ## Interpret dispersion as ~sd() or se() not var()
+    mutate(count_wt = sqrt(1/(motif_count + 1))) %>%
+    ## need to rescale wts for motif_prop data
+    mutate(prop_wt = count_wt * count_total_round) %>% 
+    ## Add vpd 
+    mutate(svp = SVP(t = temp_mean + 273.15, isK = TRUE), vpd = svp*(1-humidity_mean/100) ) %>%
+    group_by(round) %>%
+    mutate(vpd_offset = vpd - mean(vpd)) %>%
+    ungroup() %>%
+    relocate(motif_count, motif_prop, vpd, temp_mean, humidity_mean, .after = male) %>% 
+    mutate() ## Dummy function so we can comment out lines above it w/o any issues
+
+
+```
+
+
+# Examine Data  
+
+## Create Working Dataset
+
+```{r}
+
+data_ind <- data_full %>%
+    filter(round %in% c(2,3)) %>%
+    filter(count_total_round >= 1) %>%
+    mutate()
+
+## copy data frame and assign `male =  "combined")
+data_comb <- data_ind %>% mutate(male = "combined")
+
+data <- bind_rows(data_ind, data_comb)
+
+```
+
+## Examine How Var(Mean) using `round = 2`
+
+```{r}
+
+motif_count_round_2  <- data_ind %>%
+    filter(round == 2) %>%
+    select(c(male, motif_count)) %>%
+    group_by(male) %>% 
+    mutate(mean = mean(motif_count), sd = sd(motif_count), var = var(motif_count)) %>%
+    ungroup() %>%
+    unique()
+
+## Bootstrap data to get SE of var and mean
+bs_data <- motif_count_round_2 %>%
+select(male, motif_count) %>%
+    bootstraps(times=100, strata = male)
+
+bs_moments <- map_dfr(
+  bs_data$splits,
+  function(x) {
+    dat <- as.data.frame(x) %>% group_by(male) %>%
+    summarize(mean = mean(motif_count), var = var(motif_count), sd = sd(motif_count))
+  }, .id = "sample")
+
+bs_ci <- bs_moments %>%
+    group_by(male) %>%
+    summarize(mean_low = quantile(mean, 0.025),
+              mean_high = quantile(mean, 0.975),
+              sd_low = quantile(sd, 0.025),
+              sd_high = quantile(sd, 0.975),
+              var_low = quantile(var, 0.025),
+              var_high = quantile(var, 0.975)
+              )
+
+##Clearly we have very little confidence in our moment estimators
+
+motif_count_stats <- full_join(motif_count_round_2 %>% select(-motif_count) %>% unique(), bs_ci, by = "male")
+
+
+g1 <- ggplot(motif_count_round_2) +
+    aes(x=motif_count,
+        color = male,
+        fill = male) + 
+    geom_histogram() +
+    labs(title = "")
+
+g2 <- ggplot(motif_count_stats) +
+    aes(x=mean, y = sd) + 
+    geom_point(aes(color = male)) +
+    geom_smooth(method='lm', formula= y~x) +
+    geom_errorbar(aes(ymin = sd_low, ymax = sd_high)) +
+    geom_errorbarh(aes(xmin = mean_low, xmax = mean_high)) +
+    labs(title = "Mean vs. sd for Round 2: temp_target = 40")
+
+g3 <- ggplot(motif_count_stats) +
+    aes(x=mean, y = var) +
+    geom_point(aes(color = male)) +
+    geom_smooth(method='lm', formula= y~x) +
+##    geom_errorbar(aes(ymin = var_low, ymax = var_high)) +
+##    geom_errorbarh(aes(xmin = mean_low, xmax = mean_high)) +
+    labs(title = "Mean vs. Var for Round 2: temp_target = 40",
+         subtitle = "log(var) ~ log(mean)") + 
+    scale_x_log10() +
+    scale_y_log10()
+    
+#ggcoefstats(
+    
+g4 <- ggplot(motif_count_stats) +
+    aes(x=mean, y = var) +
+    geom_point(aes(color = male)) +
+    geom_smooth(method='glm', formula= y~-1 + x+I(x^2)) +
+    geom_errorbar(aes(ymin = var_low, ymax = var_high)) +
+    geom_errorbarh(aes(xmin = mean_low, xmax = mean_high)) +
+    labs(title = "Mean vs. Var for Round 2: temp_target = 40",
+         subtitle = "var ~ mean + mean^2")
+#    scale_x_log10() +
+#    scale_y_log10()
+
+grid.arrange(g1, g2, g3, g4, ncol=2)
+
+
+```
+
+## Compare Rounds 2 and 3
+
+```{r}
+
+count_total_round_2_and_3  <- data_ind %>%
+    select(c(male, count_total_round, round)) %>%
+    unique() %>%
+    pivot_wider(names_from = "round", values_from = "count_total_round")%>%
+    select(male, `2`, `3`) %>%
+    print(n=100)
+
+```
+
+## Rounds 2 and 3 vs Temp
+
+```{r}
+
+
+xlab <- "Temperature"
+ylab <- "motif_count"
+
+plot_temp_data <-
+    ggplot(data) + 
+    aes(x = temp,
+        y = motif_count) +
+    facet_wrap("male", scales = "free_y") +
+    geom_point() +
+labs( title = paste( ylab, " vs ", xlab))
+last_plot()
+
+
+pivot_wider(data_ind, names_from = "round", values_from = "count_total_round") %>% select(male, `2`, `3`) %>% filter(!is.na(`3`)) %>% unique()
+
+```
+
+
+## Formal Model Fits to `motif_count`
+
+
+Using
+
+- `x = temp -45C`
+- use `offset(log(count_total_round))` instead of `male` as a factor
+
+```{r}
+
+temp_ref <- 45
+verbose <- 0
+trace <- FALSE
+
+## Try filtering the data a bit more
+## Goal is to get good starting values
+
+data <- data_ind %>%
+    mutate(x1 = (temp - temp_ref)) %>%
+    filter(
+    (round == 3 & count_total_round >= 400) |
+    (round == 2 & count_total_round > 30)
+    ) %>%
+    mutate() %>%
+#    filter( !(male %in% c("T231", "T260"))) %>% 
+    mutate()
+
+make_plot = TRUE;
+
+glm_poisson_1 <- glm(motif_count ~
+                       (1 + male  +  (x1) + I(x1^2)),
+                   data = data,
+                   family = poisson(link = "log")
+                   )
+
+summary(glm_poisson_1)
+
+## Add round effect
+glm_poisson_2 <- glm(motif_count ~
+                       (1 + male + round +  (x1) + I(x1^2)),
+                   data = data,
+                   family = poisson(link = "log")
+                   )
+## Results support round effect
+summary(glm_poisson_2)
+
+male_coef <-  coef(glm_poisson_2) %>% keep(str_detect(names(.), 'male'))
+
+hist(male_coef, breaks = 30)
+
+## Remove male effect
+glm_poisson_3 <- glm(motif_count ~
+                       (1 + round +  (x1) + I(x1^2)),
+                   data = data,
+                   family = poisson(link = "log")
+                   )
+## Note that using qpoisson doesn't affect MLE
+
+summary(glm_poisson_3)
+
+if(make_plot){
+    ifelse(length(dev.list()) < 3, {dev.new(); dev.next()}, dev.next())
+    par(mfrow = c(2, 2))
+    plot(glm_poisson_2, ask = FALSE)
+    page_label <- "glm with poisson error"
+    mtext(page_label, outer=TRUE,  cex=1, line=-1.1)
+}
+
+glm_qpoisson_1 <- update(glm_poisson_1,
+                       family = quasipoisson(link = "log")
+                       )
+summary(glm_qpoisson_1)
+
+if(make_plot){
+    ifelse(length(dev.list()) < 3, dev.new(), dev.next())
+    par(mfrow = c(2, 2))
+    plot(glm_qpoisson_1, ask = FALSE)
+    page_label <- "glm with poisson error"
+    mtext(page_label, outer=TRUE,  cex=1, line=-1.1)
+##    dev.new()
+##    ggplot(data, aes(temp, motif_count))
+}
+
+glm_qpoisson_2 <- update(glm_poisson_2,
+                       family = quasipoisson(link = "log")
+                       )
+summary(glm_qpoisson_2)
+
+if(make_plot){
+    ifelse(length(dev.list()) < 3, dev.new(), dev.next())
+    par(mfrow = c(2, 2))
+    plot(glm_qpoisson_2, ask = FALSE)
+    page_label <- "glm with poisson error"
+    mtext(page_label, outer=TRUE,  cex=1, line=-1.1)
+##    dev.new()
+##    ggplot(data, aes(temp, motif_count))
+}
+
+
+glm_qpoisson_3 <- update(glm_poisson_3,
+                       family = quasipoisson(link = "log")
+                       )
+summary(glm_qpoisson_3)
+
+if(make_plot){
+    ifelse(length(dev.list()) < 3, dev.new(), dev.next())
+    par(mfrow = c(2, 2))
+    plot(glm_qpoisson_3, ask = FALSE)
+    page_label <- "glm with poisson error"
+    mtext(page_label, outer=TRUE,  cex=1, line=-1.1)
+##    dev.new()
+##    ggplot(data, aes(temp, motif_count))
+}
+
+```
+
+### Result
+
+- Overdispersion of data makes parameters non-significant
+- Don't how a `motif_prop` approach will solve this issue.
+  
+
